@@ -1,0 +1,14 @@
+LICENSE
+README.md
+setup.py
+complott/__init__.py
+complott/cli.py
+complott/complott.py
+complott/recipe_helper.py
+complott.egg-info/PKG-INFO
+complott.egg-info/SOURCES.txt
+complott.egg-info/dependency_links.txt
+complott.egg-info/entry_points.txt
+complott.egg-info/requires.txt
+complott.egg-info/top_level.txt
+tests/test_build.py
