@@ -1,7 +1,6 @@
 # ![ComPlotT](misc/complott_title.png)
 
-ComPlotT (Community-driven Plotting Tool) allows generating plots using a recipe system for automatically download data from official sources and handling dependencies between recipes for sharing the processed data.
-Recipes are run in constrained Docker containers for safety and reproducibility.
+ComPlotT (Community-driven Plotting Tool) generates plots using a recipe system to automatically download data from official sources and manage dependencies between recipes to share processed data. Recipes are run in constrained Docker containers for security and reproducibility.
 
 Work in progress, Come Plot soon !
 
