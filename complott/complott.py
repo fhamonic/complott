@@ -1,21 +1,15 @@
-import jsonschema
 import docker
+import graphlib
+import hashlib
 import io
 import json
+import jsonschema
 import logging
 import os
 import shutil
 import sys
-from colorama import Fore, Style
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-from urllib.request import urlretrieve
-from hashlib import sha1
-
-
-# download_cache_path = os.path.join(build_path, "download_cache")
-# artifacts_path = os.path.join(build_path, "artifacts")
-# pages_path = os.path.join(root_path, "pages")
-# verbose = True
+import urllib.parse
+import urllib.request
 
 requirements = [
     "numpy",
@@ -81,7 +75,7 @@ versions_schema = {
                     "type": "string",
                     "pattern": '^(?![ .])[^<>:"/\\|?*\r\n]+(?<![ .])$',
                 },
-                "build_folder_alias": {
+                "artifact_folder": {
                     "type": "string",
                     "pattern": '^(?![ .])[^<>:"/\\|?*\r\n]+(?<![ .])$',
                 },
@@ -91,6 +85,39 @@ versions_schema = {
         }
     },
     "additionalProperties": False,
+}
+dependency_types = {
+    "fetch": {
+        "schema": {
+            "properties": {
+                "type": {},
+                "url": {
+                    "type": "string",
+                    "pattern": "^https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$",
+                },
+                "file_name": {
+                    "type": "string",
+                    "pattern": '^(?![ .])[^<>:"/\\|?*\r\n]+(?<![ .])$',
+                },
+            },
+            "required": ["type", "url"],
+            "additionalProperties": False,
+        }
+    },
+    "build": {
+        "schema": {
+            "properties": {
+                "type": {},
+                "recipe_name": {
+                    "type": "string",
+                    "pattern": '^(?![ .])[^<>:"/\\|?*\r\n]+(?<![ .])$',
+                },
+                "version": {"type": "string"},
+            },
+            "required": ["type", "recipe_name"],
+            "additionalProperties": False,
+        }
+    },
 }
 recipe_schema = {
     "$schema": "http://json-schema.org/draft-07/schema#",
@@ -104,34 +131,13 @@ recipe_schema = {
             "type": "array",
             "items": {
                 "type": "object",
-                "oneOf": [
+                "properties": {"type": {"enum": list(dependency_types.keys())}},
+                "allOf": [
                     {
-                        "properties": {
-                            "type": {"type": "string", "const": "fetch"},
-                            "url": {
-                                "type": "string",
-                                "pattern": "^https?:\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)$",
-                            },
-                            "file_name": {
-                                "type": "string",
-                                "pattern": '^(?![ .])[^<>:"/\\|?*\r\n]+(?<![ .])$',
-                            },
-                        },
-                        "required": ["type", "url"],
-                        "additionalProperties": False,
-                    },
-                    {
-                        "properties": {
-                            "type": {"type": "string", "const": "build"},
-                            "recipe_name": {
-                                "type": "string",
-                                "pattern": '^(?![ .])[^<>:"/\\|?*\r\n]+(?<![ .])$',
-                            },
-                            "version": {"type": "string"},
-                        },
-                        "required": ["type", "recipe_name"],
-                        "additionalProperties": False,
-                    },
+                        "if": {"properties": {"type": {"const": type_name}}},
+                        "then": type["schema"],
+                    }
+                    for type_name, type in dependency_types.items()
                 ],
             },
         },
@@ -171,8 +177,8 @@ def read_recipes(recipes_path):
         recipes[recipe_name] = dict()
         for version_tag, version in versions.items():
             recipe_version_path = os.path.join(recipe_path, version["folder"])
-            if "build_folder_alias" not in version:
-                version["build_folder_alias"] = version["folder"]
+            if "artifact_folder" not in version:
+                version["artifact_folder"] = version["folder"]
 
             recipe_json_path = os.path.join(recipe_version_path, "recipe.json")
             if not os.path.exists(recipe_json_path):
@@ -190,71 +196,50 @@ def read_recipes(recipes_path):
                         + e.schema.get("error_msg", e.message)
                     )
                     continue
-
                 recipes[recipe_name][version_tag] = recipe | version
 
+        logger.debug(
+            f"Read recipe '{recipe_name}' [{','.join(recipes[recipe_name].keys())}]"
+        )
 
-# def read_recipes(recipes_path):
-#     logger = logging.getLogger("complott")
-#     logger.info("Reading recipes...")
-#     recipes = {}
-#     for item in os.listdir(recipes_path):
-#         if not os.path.isdir(os.path.join(recipes_path, item)):
-#             print(
-#                 Fore.YELLOW
-#                 + f"Warning: File '{item}' should not be in the 'recipes' folder."
-#                 + Style.RESET_ALL
-#             )
-#             continue
-#         recipe_name = item
-#         recipe_path = os.path.join(recipes_path, recipe_name)
-
-#         recipe_path = os.path.join(recipe_path, "recipe.json")
-#         if not os.path.exists(recipe_path):
-#             print(
-#                 Fore.YELLOW
-#                 + f"Warning: skipped recipe '{recipe_name}': 'recipe.json' not found."
-#                 + Style.RESET_ALL
-#             )
-#             continue
-#         with open(recipe_path) as f:
-#             d = json.load(f)
-#             try:
-#                 jsonschema.validate(d, recipe_schema)
-#             except jsonschema.ValidationError as e:
-#                 print(
-#                     Fore.YELLOW
-#                     + f"Warning: skipped recipe '{recipe_name}' because 'recipe.json' has invalid scheme:\n"
-#                     + e.schema.get("error_msg", e.message)
-#                     + Style.RESET_ALL
-#                 )
-#                 continue
-#             if "required_resources" not in d:
-#                 d["required_resources"] = {}
-#             if "generated" not in d["required_resources"]:
-#                 d["required_resources"]["generated"] = []
-#             if "downloaded" not in d["required_resources"]:
-#                 d["required_resources"]["downloaded"] = {}
-#             if "generate_resources" not in d:
-#                 d["generate_resources"] = False
-#             recipes[recipe_name] = d
-
-
-# print(Fore.GREEN + "Verifying integrity......" + Style.RESET_ALL)
+    return recipes
 
 
 def normalize_url(url):
-    parsed = urlparse(url)
+    parsed = urllib.parse.urlparse(url)
     netloc = parsed.hostname.lower() if parsed.hostname else ""
     if parsed.port and parsed.port not in (80, 443):
         netloc += f":{parsed.port}"
     path = parsed.path.rstrip("/")
-    query = urlencode(sorted(parse_qsl(parsed.query)))
-    return urlunparse((parsed.scheme.lower(), netloc, path, parsed.params, query, ""))
+    query = urllib.parse.urlencode(sorted(urllib.parse.parse_qsl(parsed.query)))
+    return urllib.parse.urlunparse(
+        (parsed.scheme.lower(), netloc, path, parsed.params, query, "")
+    )
 
 
 def hash_string(s):
-    return str(int(sha1(s.encode("utf-8")).hexdigest(), 16) % 10**16)
+    return str(int(hashlib.sha1(s.encode("utf-8")).hexdigest(), 16) % 10**16)
+
+
+def compute_dependencies_graph(recipes):
+    logger = logging.getLogger("complott")
+    logger.info("Computing dependencies graph...")
+    topological_sorter = graphlib.TopologicalSorter()
+
+    for recipe_name, recipe_versions in recipes.items():
+        for version_tag, version in recipe_versions.items():
+            recipe_node = f"{recipe_name}/{version_tag}"
+            topological_sorter.add(recipe_node)
+            for dependency in version["dependencies"]:
+                if dependency["type"] not in dependency_types:
+                    logger.critical(
+                        "Dependency type '{}' is unknwon but passed JSON validation.".format(
+                            dependency["type"]
+                        )
+                    )
+                    sys.exit(os.EX_CONFIG)
+
+    return topological_sorter
 
 
 # invalid_recipe_names = []
@@ -327,7 +312,7 @@ def hash_string(s):
 #         resource_file_name = hash_string(resource_url)
 #         resource_path = os.path.join(download_cache_path, resource_file_name)
 #         try:
-#             urlretrieve(resource_url, resource_path)
+#             urllib.request.urlretrieve(resource_url, resource_path)
 #         except Exception as e:
 #             print(
 #                 Fore.YELLOW

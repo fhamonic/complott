@@ -2,7 +2,7 @@ import click
 import logging
 from colorama import Fore, Style
 
-from complott.complott import build_docker_python_sandbox_image, read_recipes
+from complott.complott import build_docker_python_sandbox_image, read_recipes, compute_dependencies_graph
 
 
 class CustomFormatter(logging.Formatter):
@@ -47,9 +47,11 @@ def cli():
 )
 def build(recipes_folder, build_folder):
     """Build all recipes"""
-
     build_docker_python_sandbox_image()
     recipes = read_recipes(recipes_folder)
+    dependencies_graph = compute_dependencies_graph(recipes)
+
+    print(dependencies_graph)
 
 
 if __name__ == "__main__":
