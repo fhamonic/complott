@@ -1,3 +1,4 @@
+import abc
 import docker
 import filecmp
 import graphlib
@@ -33,7 +34,7 @@ RUN pip install --no-cache-dir """
     + " ".join(Dependencys)
     + """ --no-warn-script-location
 WORKDIR /app
-ENTRYPOINT ["python", "/app/recipe/generate.py"]"""
+ENTRYPOINT ["python", "recipe/generate.py"]"""
 )
 
 
@@ -90,21 +91,18 @@ versions_schema = {
 }
 
 
-class Artifact:
-    def build(self, recipes_folder, build_folder):
-        raise NotImplementedError(
-            f"Class {self.__class__.__name__} doesn't implement build()"
-        )
+class Artifact(abc.ABC):
+    @abc.abstractmethod
+    def build(self, recipes_folder, build_folder, artifacts, override=False):
+        pass
 
+    @abc.abstractmethod
     def get_build_path(self, build_folder):
-        raise NotImplementedError(
-            f"Class {self.__class__.__name__} doesn't implement get_build_path(<build_folder>)"
-        )
+        pass
 
+    @abc.abstractmethod
     def id(self):
-        raise NotImplementedError(
-            f"Class {self.__class__.__name__} doesn't implement id()"
-        )
+        pass
 
 
 class Recipe(Artifact):
@@ -119,10 +117,12 @@ class Recipe(Artifact):
         self.dependencies = dependencies
 
     def get_source_path(self, recipes_folder):
-        return os.join(recipes_folder, self.name, self.version_source_folder)
+        return os.path.join(recipes_folder, self.name, self.version_source_folder)
 
     def get_build_path(self, build_folder):
-        return os.join(build_folder, "recipes", self.name, self.version_build_folder)
+        return os.path.join(
+            build_folder, "recipes", self.name, self.version_build_folder
+        )
 
     def id(self):
         return f"{Recipe.__name__}:{self.name}/{self.version}"
@@ -143,27 +143,40 @@ class PythonRecipe(Recipe):
     def __init__(self, recipe_name, recipe_version, version_json, dependencies):
         super().__init__(recipe_name, recipe_version, version_json, dependencies)
 
-    def build(self, recipes_folder, build_folder, override=False):
-        super().build(recipes_folder, build_folder)
+    def build(self, recipes_folder, build_folder, artifacts, override=False):
+        super().build(recipes_folder, build_folder, artifacts, override)
         logger = logging.getLogger("complott")
 
         recipe_path = self.get_source_path(recipes_folder)
         build_path = self.get_build_path(build_folder)
 
-        if not left_files_changed(recipe_path, build_path) and not override:
-            logger.debug(f"({self.name}): Skipped, recipe did not changed.")
-            return True
         if os.path.exists(build_path):
+            if (
+                not left_files_changed(filecmp.dircmp(recipe_path, build_path))
+                and not override
+            ):
+                logger.debug(f"({self.name}): Skipped, recipe did not changed.")
+                return
             shutil.rmtree(build_path)
+
         shutil.copytree(recipe_path, build_path)
 
         volumes = {}
         volumes[build_path] = {
             "bind": "/app/recipe",
+            "mode": "ro",
+        }
+        data_path = os.path.join(build_path, "data")
+        if not os.path.exists(os.path.join(build_path, "data")):
+            os.makedirs(data_path)
+        volumes[data_path] = {
+            "bind": "/app/data",
             "mode": "rw",
         }
         for dependency in self.dependencies:
-            volumes[dependency.get_build_path(build_folder)] = {
+            volumes[
+                artifacts[dependency.artifact_id()].get_build_path(build_folder)
+            ] = {
                 "bind": f"/app/dependencies/{dependency.get_mounting_path()}",
                 "mode": "ro",
             }
@@ -183,12 +196,10 @@ class PythonRecipe(Recipe):
             match e.exit_status:
                 case 1:
                     logger.error(f"({self.name}): {e.stderr.decode('utf-8')}")
-                    return False
+                    raise e
                 case 137:
                     logger.error(f"({self.name}): Container exceeded memory limit.")
-                    return False
-
-        return True
+                    raise e
 
 
 recipe_types = {"python": PythonRecipe}
@@ -206,10 +217,6 @@ def normalize_url(url):
     )
 
 
-def hash_string(s):
-    return
-
-
 class Fetch(Artifact):
     def __init__(self, dependency_json):
         super().__init__()
@@ -217,7 +224,7 @@ class Fetch(Artifact):
 
     def get_build_path(self, build_folder):
         cache_file_name = hashlib.sha1(self.url.encode("utf-8")).hexdigest()[:24]
-        return os.join(build_folder, "fetch_cache", cache_file_name)
+        return os.path.join(build_folder, "fetch_cache", cache_file_name)
 
     def id(self):
         return f"{Fetch.__name__}:{self.url}"
@@ -229,7 +236,7 @@ class Fetch(Artifact):
         else:
             return f"{self.url[:20]}...{self.url[-46:]}"
 
-    def build(self, recipes_folder, build_folder, override=False):
+    def build(self, recipes_folder, build_folder, artifacts, override=False):
         logger = logging.getLogger("complott")
         cache_file_path = self.get_build_path(build_folder)
         if os.path.exists(cache_file_path) and not override:
@@ -237,27 +244,28 @@ class Fetch(Artifact):
             return True
 
         try:
+            fetch_folder = os.path.join(build_folder, "fetch_cache")
+            if not os.path.exists(fetch_folder):
+                os.mkdir(fetch_folder)
             urllib.request.urlretrieve(self.url, cache_file_path)
         except Exception as e:
-            logger.error(f"Failed to download resource '{self.url}' ({e})")
+            logger.error(f"Failed to download resource '{self.url}'\n ---> {e}")
             if os.path.exists(cache_file_path):
                 os.remove(cache_file_path)
-            raise False
+            raise e
 
         logger.debug(f"Fetched:  {self._compact_url(70)}")
         return True
 
 
-class Dependency:
+class Dependency(abc.ABC):
+    @abc.abstractmethod
     def get_mounting_path(self):
-        raise NotImplementedError(
-            f"Class {self.__class__.__name__} doesn't implement get_mounting_path()"
-        )
+        pass
 
+    @abc.abstractmethod
     def artifact_id(self):
-        raise NotImplementedError(
-            f"Class {self.__class__.__name__} doesn't implement artifact_id()"
-        )
+        pass
 
 
 class FetchDependency(Dependency):
@@ -291,7 +299,7 @@ class RecipeDependency(Dependency):
         self.version = dependency_json["version"]
 
     def get_mounting_path(self):
-        return f"recipes/{self.artifact.name}/{self.artifact.version}"
+        return f"recipes/{self.recipe_name}/{self.version}/data"
 
     def artifact_id(self):
         return f"{Recipe.__name__}:{self.recipe_name}/{self.version}"
@@ -454,24 +462,42 @@ def build_all(
     build_folder,
     artifacts,
     dependencies_graph,
-    num_jobs=1,
     override=False,
+    num_jobs=1,
 ):
-    print(build_folder)
+    logger = logging.getLogger("complott")
+    if not os.path.exists(build_folder):
+        os.mkdir(build_folder)
 
+    failed_artifacts_ids = set()
 
     # task_queue = queue.Queue()
     dependencies_graph.prepare()
     while dependencies_graph.is_active():
         for artifact_id in dependencies_graph.get_ready():
+            artifact = artifacts[artifact_id]
+
+            if isinstance(artifact, Recipe):
+                for dependency in artifact.dependencies:
+                    dependency_artifact_id = dependency.artifact_id()
+                    if dependency_artifact_id in failed_artifacts_ids:
+                        logger.warning(
+                            f"Skipped '{artifact_id}', dependency '{dependency_artifact_id}' failed."
+                        )
+                        failed_artifacts_ids.add(artifact_id)
+                        dependencies_graph.done(artifact_id)
+                        break
+                if artifact_id in failed_artifacts_ids: continue
+                        
+
             # task_queue.put(artifact)
+
             try:
-                # print(artifact_id)
-                # dependencies_graph.done(artifact_id)
-
-
-                artifact = artifacts[artifact_id]
-                if artifact.build(recipes_folder, build_folder, override=override):
-                    dependencies_graph.done(artifact_id)
+                artifact.build(
+                    recipes_folder, build_folder, artifacts, override=override
+                )
             except Exception as e:
-                pass
+                logger.error(f"While building '{artifact_id}':\n ---> {e}")
+                failed_artifacts_ids.add(artifact_id)
+
+            dependencies_graph.done(artifact_id)

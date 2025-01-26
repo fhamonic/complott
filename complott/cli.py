@@ -1,5 +1,6 @@
 import click
 import logging
+import os
 from colorama import Fore, Style
 
 from complott.complott import (
@@ -45,18 +46,34 @@ def cli():
 @click.argument("recipes_folder", type=click.Path())
 @click.option(
     "--build-folder",
-    "-of",
+    "-bf",
     default="./build",
     help="The folder containing all recipes.",
     type=click.Path(),
 )
-def build(recipes_folder, build_folder):
+@click.option(
+    "--override", "-f", help="Forces to build unchanged recipes.", is_flag=True
+)
+@click.option(
+    "--num-jobs", "-j", default=1, help="Number of parallel jobs for building."
+)
+def build(recipes_folder, build_folder, override, num_jobs):
     """Build all recipes"""
+    recipes_folder = os.path.abspath(recipes_folder)
+    build_folder = os.path.abspath(build_folder)
+
     build_docker_python_sandbox_image()
     artifacts = read_recipes(recipes_folder)
     dependencies_graph = compute_dependencies_graph(artifacts)
 
-    build_all(recipes_folder, build_folder, artifacts, dependencies_graph, num_jobs=1)
+    build_all(
+        recipes_folder,
+        build_folder,
+        artifacts,
+        dependencies_graph,
+        override=override,
+        num_jobs=num_jobs,
+    )
 
 
 if __name__ == "__main__":
