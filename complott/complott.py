@@ -1,4 +1,5 @@
 import docker
+import filecmp
 import graphlib
 import hashlib
 import io
@@ -6,12 +7,13 @@ import json
 import jsonschema
 import logging
 import os
+import queue
 import shutil
 import sys
 import urllib.parse
 import urllib.request
 
-requirements = [
+Dependencys = [
     "numpy",
     "pandas",
     "xlrd",
@@ -28,7 +30,7 @@ RUN adduser appuser --uid "$UID" --gid "$GID" --disabled-password --gecos ""
 USER appuser
 RUN pip install --no-cache-dir --upgrade pip --no-warn-script-location
 RUN pip install --no-cache-dir """
-    + " ".join(requirements)
+    + " ".join(Dependencys)
     + """ --no-warn-script-location
 WORKDIR /app
 ENTRYPOINT ["python", "/app/recipe/generate.py"]"""
@@ -86,6 +88,219 @@ versions_schema = {
     },
     "additionalProperties": False,
 }
+
+
+class Artifact:
+    def build(self, recipes_folder, build_folder):
+        raise NotImplementedError(
+            f"Class {self.__class__.__name__} doesn't implement build()"
+        )
+
+    def get_build_path(self, build_folder):
+        raise NotImplementedError(
+            f"Class {self.__class__.__name__} doesn't implement get_build_path(<build_folder>)"
+        )
+
+    def id(self):
+        raise NotImplementedError(
+            f"Class {self.__class__.__name__} doesn't implement id()"
+        )
+
+
+class Recipe(Artifact):
+    def __init__(self, recipe_name, recipe_version, version_json, dependencies):
+        self.name = recipe_name
+        self.version = recipe_version
+        self.version_source_folder = version_json["folder"]
+        if "folder_alias" in version_json:
+            self.version_build_folder = version_json["folder_alias"]
+        else:
+            self.version_build_folder = self.version_source_folder
+        self.dependencies = dependencies
+
+    def get_source_path(self, recipes_folder):
+        return os.join(recipes_folder, self.name, self.version_source_folder)
+
+    def get_build_path(self, build_folder):
+        return os.join(build_folder, "recipes", self.name, self.version_build_folder)
+
+    def id(self):
+        return f"{Recipe.__name__}:{self.name}/{self.version}"
+
+
+def left_files_changed(dcmp):
+    if len(dcmp.left_only) > 0:
+        return True
+    if len(dcmp.diff_files) > 0:
+        return True
+    for sub_dcmp in dcmp.subdirs.values():
+        if left_files_changed(sub_dcmp):
+            return True
+    return False
+
+
+class PythonRecipe(Recipe):
+    def __init__(self, recipe_name, recipe_version, version_json, dependencies):
+        super().__init__(recipe_name, recipe_version, version_json, dependencies)
+
+    def build(self, recipes_folder, build_folder, override=False):
+        super().build(recipes_folder, build_folder)
+        logger = logging.getLogger("complott")
+
+        recipe_path = self.get_source_path(recipes_folder)
+        build_path = self.get_build_path(build_folder)
+
+        if not left_files_changed(recipe_path, build_path) and not override:
+            logger.debug(f"({self.name}): Skipped, recipe did not changed.")
+            return True
+        if os.path.exists(build_path):
+            shutil.rmtree(build_path)
+        shutil.copytree(recipe_path, build_path)
+
+        volumes = {}
+        volumes[build_path] = {
+            "bind": "/app/recipe",
+            "mode": "rw",
+        }
+        for dependency in self.dependencies:
+            volumes[dependency.get_build_path(build_folder)] = {
+                "bind": f"/app/dependencies/{dependency.get_mounting_path()}",
+                "mode": "ro",
+            }
+
+        logger.info(f"({self.name}): Running recipe...")
+        try:
+            client = docker.from_env()
+            container_logs = client.containers.run(
+                "recipe-sandbox",
+                remove=True,
+                volumes=volumes,
+                network_disabled=True,
+                mem_limit="1000m",
+            )
+            logger.debug(f"({self.name}): {container_logs.decode('utf-8')}")
+        except docker.errors.ContainerError as e:
+            match e.exit_status:
+                case 1:
+                    logger.error(f"({self.name}): {e.stderr.decode('utf-8')}")
+                    return False
+                case 137:
+                    logger.error(f"({self.name}): Container exceeded memory limit.")
+                    return False
+
+        return True
+
+
+recipe_types = {"python": PythonRecipe}
+
+
+def normalize_url(url):
+    parsed = urllib.parse.urlparse(url)
+    netloc = parsed.hostname.lower() if parsed.hostname else ""
+    if parsed.port and parsed.port not in (80, 443):
+        netloc += f":{parsed.port}"
+    path = parsed.path.rstrip("/")
+    query = urllib.parse.urlencode(sorted(urllib.parse.parse_qsl(parsed.query)))
+    return urllib.parse.urlunparse(
+        (parsed.scheme.lower(), netloc, path, parsed.params, query, "")
+    )
+
+
+def hash_string(s):
+    return
+
+
+class Fetch(Artifact):
+    def __init__(self, dependency_json):
+        super().__init__()
+        self.url = normalize_url(dependency_json["url"])
+
+    def get_build_path(self, build_folder):
+        cache_file_name = hashlib.sha1(self.url.encode("utf-8")).hexdigest()[:24]
+        return os.join(build_folder, "fetch_cache", cache_file_name)
+
+    def id(self):
+        return f"{Fetch.__name__}:{self.url}"
+
+    def _compact_url(self, max_length):
+        url_length = len(self.url)
+        if url_length <= max_length:
+            return self.url
+        else:
+            return f"{self.url[:20]}...{self.url[-46:]}"
+
+    def build(self, recipes_folder, build_folder, override=False):
+        logger = logging.getLogger("complott")
+        cache_file_path = self.get_build_path(build_folder)
+        if os.path.exists(cache_file_path) and not override:
+            logger.debug(f"In cache: {self._compact_url(70)}")
+            return True
+
+        try:
+            urllib.request.urlretrieve(self.url, cache_file_path)
+        except Exception as e:
+            logger.error(f"Failed to download resource '{self.url}' ({e})")
+            if os.path.exists(cache_file_path):
+                os.remove(cache_file_path)
+            raise False
+
+        logger.debug(f"Fetched:  {self._compact_url(70)}")
+        return True
+
+
+class Dependency:
+    def get_mounting_path(self):
+        raise NotImplementedError(
+            f"Class {self.__class__.__name__} doesn't implement get_mounting_path()"
+        )
+
+    def artifact_id(self):
+        raise NotImplementedError(
+            f"Class {self.__class__.__name__} doesn't implement artifact_id()"
+        )
+
+
+class FetchDependency(Dependency):
+    def __init__(self, artifact, dependency_json):
+        super().__init__()
+        self._artifact = artifact
+        if "file_name" in dependency_json:
+            self.file_name = dependency_json["file_name"]
+        else:
+            self.file_name = artifact.url[artifact.url.rfind("/") + 1 :]
+
+    def get_mounting_path(self):
+        return f"fetch/{self.file_name}"
+
+    def artifact_id(self):
+        return self._artifact.id()
+
+
+def register_fetch_dependency(artifacts, dependency_json):
+    artifact = Fetch(dependency_json)
+    artifact_id = artifact.id()
+    if artifact_id not in artifacts:
+        artifacts[artifact_id] = artifact
+    return FetchDependency(artifact, dependency_json)
+
+
+class RecipeDependency(Dependency):
+    def __init__(self, dependency_json):
+        super().__init__()
+        self.recipe_name = dependency_json["recipe_name"]
+        self.version = dependency_json["version"]
+
+    def get_mounting_path(self):
+        return f"recipes/{self.artifact.name}/{self.artifact.version}"
+
+    def artifact_id(self):
+        return f"{Recipe.__name__}:{self.recipe_name}/{self.version}"
+
+
+def register_recipe_dependency(artifacts, dependency_json):
+    return RecipeDependency(dependency_json)
+
+
 dependency_types = {
     "fetch": {
         "schema": {
@@ -102,7 +317,8 @@ dependency_types = {
             },
             "required": ["type", "url"],
             "additionalProperties": False,
-        }
+        },
+        "register_function": register_fetch_dependency,
     },
     "build": {
         "schema": {
@@ -114,9 +330,10 @@ dependency_types = {
                 },
                 "version": {"type": "string"},
             },
-            "required": ["type", "recipe_name"],
+            "required": ["type", "recipe_name", "version"],
             "additionalProperties": False,
-        }
+        },
+        "register_function": register_recipe_dependency,
     },
 }
 recipe_schema = {
@@ -125,7 +342,7 @@ recipe_schema = {
     "properties": {
         "recipe_type": {
             "type": "string",
-            "enum": ["python"],
+            "enum": list(recipe_types.keys()),
         },
         "dependencies": {
             "type": "array",
@@ -147,15 +364,15 @@ recipe_schema = {
 }
 
 
-def read_recipes(recipes_path):
+def read_recipes(recipes_folder):
     logger = logging.getLogger("complott")
     logger.info("Reading recipes...")
-    recipes = {}
-    for item in os.listdir(recipes_path):
-        if not os.path.isdir(os.path.join(recipes_path, item)):
+    artifacts = dict()
+    for item in os.listdir(recipes_folder):
+        if not os.path.isdir(os.path.join(recipes_folder, item)):
             continue
         recipe_name = item
-        recipe_path = os.path.join(recipes_path, recipe_name)
+        recipe_path = os.path.join(recipes_folder, recipe_name)
 
         versions_json_path = os.path.join(recipe_path, "versions.json")
         if not os.path.exists(versions_json_path):
@@ -174,273 +391,87 @@ def read_recipes(recipes_path):
                 )
                 continue
 
-        recipes[recipe_name] = dict()
-        for version_tag, version in versions.items():
-            recipe_version_path = os.path.join(recipe_path, version["folder"])
-            if "artifact_folder" not in version:
-                version["artifact_folder"] = version["folder"]
-
+        for version_name, version_json in versions.items():
+            recipe_version_path = os.path.join(recipe_path, version_json["folder"])
             recipe_json_path = os.path.join(recipe_version_path, "recipe.json")
             if not os.path.exists(recipe_json_path):
                 logger.warning(
-                    f"Skipped recipe '{recipe_name}/{version_tag}', 'recipe.json' not found."
+                    f"Skipped recipe '{recipe_name}/{version_name}', 'recipe.json' not found."
                 )
                 continue
             with open(recipe_json_path) as recipe_file:
-                recipe = json.load(recipe_file)
+                recipe_json = json.load(recipe_file)
                 try:
-                    jsonschema.validate(recipe, recipe_schema)
+                    jsonschema.validate(recipe_json, recipe_schema)
                 except jsonschema.ValidationError as e:
                     logger.warning(
-                        f"Skipped recipe '{recipe_name}/{version_tag}', 'recipe.json' has invalid scheme:\n ---> "
+                        f"Skipped recipe '{recipe_name}/{version_name}', 'recipe.json' has invalid scheme:\n ---> "
                         + e.schema.get("error_msg", e.message)
                     )
                     continue
-                recipes[recipe_name][version_tag] = recipe | version
 
-        logger.debug(
-            f"Read recipe '{recipe_name}' [{','.join(recipes[recipe_name].keys())}]"
-        )
+                recipe_dependencies = []
+                for dependency_json in recipe_json["dependencies"]:
+                    dependency_type = dependency_json["type"]
+                    if dependency_type not in dependency_types:
+                        logger.critical(
+                            "Dependency type '{}' is unknwon but passed JSON validation.".format(
+                                dependency_type
+                            )
+                        )
+                        sys.exit(os.EX_CONFIG)
 
-    return recipes
+                    recipe_dependencies.append(
+                        dependency_types[dependency_type]["register_function"](
+                            artifacts, dependency_json
+                        )
+                    )
+                recipe = recipe_types[recipe_json["recipe_type"]](
+                    recipe_name, version_name, version_json, recipe_dependencies
+                )
+                artifacts[recipe.id()] = recipe
+                logger.debug(f"Added recipe '{recipe.name}/{recipe.version}'")
+
+    return artifacts
 
 
-def normalize_url(url):
-    parsed = urllib.parse.urlparse(url)
-    netloc = parsed.hostname.lower() if parsed.hostname else ""
-    if parsed.port and parsed.port not in (80, 443):
-        netloc += f":{parsed.port}"
-    path = parsed.path.rstrip("/")
-    query = urllib.parse.urlencode(sorted(urllib.parse.parse_qsl(parsed.query)))
-    return urllib.parse.urlunparse(
-        (parsed.scheme.lower(), netloc, path, parsed.params, query, "")
-    )
-
-
-def hash_string(s):
-    return str(int(hashlib.sha1(s.encode("utf-8")).hexdigest(), 16) % 10**16)
-
-
-def compute_dependencies_graph(recipes):
+def compute_dependencies_graph(artifacts):
     logger = logging.getLogger("complott")
     logger.info("Computing dependencies graph...")
     topological_sorter = graphlib.TopologicalSorter()
 
-    for recipe_name, recipe_versions in recipes.items():
-        for version_tag, version in recipe_versions.items():
-            recipe_node = f"{recipe_name}/{version_tag}"
-            topological_sorter.add(recipe_node)
-            for dependency in version["dependencies"]:
-                if dependency["type"] not in dependency_types:
-                    logger.critical(
-                        "Dependency type '{}' is unknwon but passed JSON validation.".format(
-                            dependency["type"]
-                        )
-                    )
-                    sys.exit(os.EX_CONFIG)
+    for artifact in artifacts.values():
+        if not isinstance(artifact, Recipe):
+            continue
+        for dependency in artifact.dependencies:
+            topological_sorter.add(artifact.id(), dependency.artifact_id())
 
     return topological_sorter
 
 
-# invalid_recipe_names = []
-# resources_to_generate_for_recipes = {}
-# resources_to_download_for_recipes = {}
-# for recipe_name, recipe in recipes.items():
-#     for required_recipe_name in recipe["required_resources"]["generated"]:
-#         if required_recipe_name not in recipes:
-#             print(
-#                 Fore.YELLOW
-#                 + f"Warning: skipped recipe '{recipe_name}' because dependency '{required_recipe_name}' is unknown."
-#                 + Style.RESET_ALL
-#             )
-#             invalid_recipe_names.append(recipe_name)
-#             continue
-#         if not recipes[required_recipe_name]["generate_resources"]:
-#             print(
-#                 Fore.YELLOW
-#                 + f"Warning: skipped recipe '{recipe_name}' because dependency '{required_recipe_name}' does not generate resources."
-#                 + Style.RESET_ALL
-#             )
-#             invalid_recipe_names.append(recipe_name)
-#             continue
-#         if required_recipe_name not in resources_to_generate_for_recipes:
-#             resources_to_generate_for_recipes[required_recipe_name] = []
-#         resources_to_generate_for_recipes[required_recipe_name].append(recipe_name)
-
-#     for resource_alias, resource_url in recipe["required_resources"][
-#         "downloaded"
-#     ].items():
-#         normalized_resource_url = normalize_url(resource_url)
-#         recipe["required_resources"]["downloaded"][
-#             resource_alias
-#         ] = normalized_resource_url
-#         if normalized_resource_url not in resources_to_download_for_recipes:
-#             resources_to_download_for_recipes[normalized_resource_url] = []
-#         resources_to_download_for_recipes[normalized_resource_url].append(recipe_name)
-
-# for invalid_recipe_name in invalid_recipe_names:
-#     del recipes[recipe_name]
-
-# unfulfilled_recipes_requirements = {
-#     recipe_name: {
-#         "downloaded": list(recipe["required_resources"]["downloaded"].values()),
-#         "generated": recipe["required_resources"]["generated"].copy(),
-#     }
-#     for recipe_name, recipe in recipes.items()
-# }
+def build_all(
+    recipes_folder,
+    build_folder,
+    artifacts,
+    dependencies_graph,
+    num_jobs=1,
+    override=False,
+):
+    print(build_folder)
 
 
-# def notify_downloaded_resource(resource_url):
-#     for requiring_recipe in resources_to_download_for_recipes[resource_url]:
-#         unfulfilled_recipes_requirements[requiring_recipe]["downloaded"].remove(
-#             resource_url
-#         )
+    # task_queue = queue.Queue()
+    dependencies_graph.prepare()
+    while dependencies_graph.is_active():
+        for artifact_id in dependencies_graph.get_ready():
+            # task_queue.put(artifact)
+            try:
+                # print(artifact_id)
+                # dependencies_graph.done(artifact_id)
 
 
-# print(Fore.GREEN + "Downloading resources..." + Style.RESET_ALL)
-# if not os.path.exists(download_cache_path):
-#     os.makedirs(download_cache_path)
-# resources_index_path = os.path.join(download_cache_path, "index.json")
-# if os.path.exists(resources_index_path):
-#     with open(resources_index_path, "r") as f:
-#         resources_index = json.load(f)
-# else:
-#     resources_index = {}
-
-# for resource_url, requiring_recipes in resources_to_download_for_recipes.items():
-#     if resource_url not in resources_index:
-#         resource_file_name = hash_string(resource_url)
-#         resource_path = os.path.join(download_cache_path, resource_file_name)
-#         try:
-#             urllib.request.urlretrieve(resource_url, resource_path)
-#         except Exception as e:
-#             print(
-#                 Fore.YELLOW
-#                 + f"Warning: failed to download resource '{resource_url}' ({e})"
-#                 + Style.RESET_ALL
-#             )
-#             if os.path.exists(resource_path):
-#                 os.remove(resource_path)
-#             continue
-#         resources_index[resource_url] = resource_file_name
-#         if verbose:
-#             print("Donwload: ", end="")
-#     else:
-#         if verbose:
-#             print("In cache: ", end="")
-#     url_length = len(resource_url)
-#     if verbose:
-#         if url_length <= 70:
-#             print(resource_url)
-#         else:
-#             print(f"{resource_url[:20]}...{resource_url[-46:]}")
-#     notify_downloaded_resource(resource_url)
-
-# with open(resources_index_path, "w") as f:
-#     json.dump(resources_index, f, indent=4)
-
-# print(Fore.GREEN + "Running recipes.........." + Style.RESET_ALL)
-# import queue
-
-# recipes_to_run = queue.Queue()
-
-
-# def can_recipe_be_run(recipe_name):
-#     unfulfilled_downloads = unfulfilled_recipes_requirements[recipe_name]["downloaded"]
-#     unfulfilled_generations = unfulfilled_recipes_requirements[recipe_name]["generated"]
-#     return len(unfulfilled_downloads) == 0 and len(unfulfilled_generations) == 0
-
-
-# def notify_generated_resource(resource_name):
-#     if resource_name not in resources_to_generate_for_recipes:
-#         return
-#     for requiring_recipe_name in resources_to_generate_for_recipes[resource_name]:
-#         unfulfilled_recipes_requirements[requiring_recipe_name]["generated"].remove(
-#             resource_name
-#         )
-#         if can_recipe_be_run(requiring_recipe_name):
-#             recipes_to_run.put(requiring_recipe_name)
-
-
-# for recipe_name in recipes.keys():
-#     if can_recipe_be_run(recipe_name):
-#         recipes_to_run.put(recipe_name)
-
-
-# while not recipes_to_run.empty():
-#     recipe_name = recipes_to_run.get()
-#     recipe = recipes[recipe_name]
-
-#     volumes = {}
-#     volumes[os.path.join(recipes_path, recipe_name)] = {
-#         "bind": "/app/recipe",
-#         "mode": "ro",
-#     }
-#     for resource_alias, resource_url in recipe["required_resources"][
-#         "downloaded"
-#     ].items():
-#         volumes[os.path.join(download_cache_path, resources_index[resource_url])] = {
-#             "bind": f"/app/resources/downloaded/{resource_alias}",
-#             "mode": "ro",
-#         }
-#     for required_resource_name in recipe["required_resources"]["generated"]:
-#         volumes[os.path.join(generated_resources_path, required_resource_name)] = {
-#             "bind": f"/app/resources/generated/{required_resource_name}",
-#             "mode": "ro",
-#         }
-#     if recipe["generate_resources"]:
-#         path = os.path.join(generated_resources_path, recipe_name)
-#         if os.path.exists(path):
-#             shutil.rmtree(path)
-#         os.makedirs(path)
-#         volumes[path] = {
-#             "bind": f"/app/resources/generated/{recipe_name}",
-#             "mode": "rw",
-#         }
-#     for page_folder in recipe["pages"].values():
-#         path = os.path.join(pages_path, recipe_name, page_folder)
-#         if not os.path.exists(path):
-#             os.makedirs(path)
-#         volumes[path] = {
-#             "bind": f"/app/pages/{recipe_name}/{page_folder}",
-#             "mode": "rw",
-#         }
-
-#     if verbose:
-#         print(f"Running recipe '{recipe_name}'")
-
-#     try:
-#         container_logs = client.containers.run(
-#             "recipe-sandbox",
-#             remove=True,
-#             volumes=volumes,
-#             network_disabled=True,
-#             mem_limit="1000m",
-#         )
-#         if verbose:
-#             print(container_logs.decode("utf-8"), end="")
-#     except docker.errors.ContainerError as e:
-#         match e.exit_status:
-#             case 1:
-#                 print(Fore.RED + e.stderr.decode("utf-8") + Style.RESET_ALL)
-#                 continue
-#             case 137:
-#                 print(Fore.RED + "Container exceeded memory limit" + Style.RESET_ALL)
-#                 continue
-
-#     if recipe["generate_resources"]:
-#         notify_generated_resource(recipe_name)
-
-# unbuilt_recipes_names = [
-#     recipe_name for recipe_name in recipes.keys() if not can_recipe_be_run(recipe_name)
-# ]
-# if len(unbuilt_recipes_names) > 0:
-#     print(
-#         Fore.YELLOW
-#         + f"Warning: The following recipes were not built because of missing requirements:"
-#     )
-#     for recipe_name in unbuilt_recipes_names:
-#         print(
-#             f"\t-{recipe_name} ({unfulfilled_recipes_requirements[recipe_name]['generated']},{unfulfilled_recipes_requirements[recipe_name]['downloaded']})"
-#         )
-#     print(Style.RESET_ALL)
+                artifact = artifacts[artifact_id]
+                if artifact.build(recipes_folder, build_folder, override=override):
+                    dependencies_graph.done(artifact_id)
+            except Exception as e:
+                pass
