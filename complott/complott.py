@@ -177,11 +177,10 @@ class PythonRecipe(Recipe):
             volumes[
                 artifacts[dependency.artifact_id()].get_build_path(build_folder)
             ] = {
-                "bind": f"/app/dependencies/{dependency.get_mounting_path()}",
+                "bind": f"/app/{dependency.get_mounting_path()}",
                 "mode": "ro",
             }
 
-        logger.info(f"({self.name}): Running recipe...")
         try:
             client = docker.from_env()
             container_logs = client.containers.run(
@@ -191,15 +190,15 @@ class PythonRecipe(Recipe):
                 network_disabled=True,
                 mem_limit="1000m",
             )
-            logger.debug(f"({self.name}): {container_logs.decode('utf-8')}")
+            container_logs_str = container_logs.decode("utf-8")
+            if len(container_logs_str) > 0:
+                logger.debug(f"({self.artifact_id()}): {container_logs_str}")
         except docker.errors.ContainerError as e:
             match e.exit_status:
                 case 1:
-                    logger.error(f"({self.name}): {e.stderr.decode('utf-8')}")
-                    raise e
+                    raise Exception(e.stderr.decode("utf-8"))
                 case 137:
-                    logger.error(f"({self.name}): Container exceeded memory limit.")
-                    raise e
+                    raise Exception(f"({self.name}): Container exceeded memory limit.")
 
 
 recipe_types = {"python": PythonRecipe}
@@ -278,7 +277,7 @@ class FetchDependency(Dependency):
             self.file_name = artifact.url[artifact.url.rfind("/") + 1 :]
 
     def get_mounting_path(self):
-        return f"fetch/{self.file_name}"
+        return f"fetched/{self.file_name}"
 
     def artifact_id(self):
         return self._artifact.id()
@@ -299,7 +298,7 @@ class RecipeDependency(Dependency):
         self.version = dependency_json["version"]
 
     def get_mounting_path(self):
-        return f"recipes/{self.recipe_name}/{self.version}/data"
+        return f"recipes/{self.recipe_name}/{self.version}"
 
     def artifact_id(self):
         return f"{Recipe.__name__}:{self.recipe_name}/{self.version}"
@@ -469,6 +468,7 @@ def build_all(
     if not os.path.exists(build_folder):
         os.mkdir(build_folder)
 
+    logger.info(f"Building artifacts...")
     failed_artifacts_ids = set()
 
     # task_queue = queue.Queue()
@@ -487,8 +487,8 @@ def build_all(
                         failed_artifacts_ids.add(artifact_id)
                         dependencies_graph.done(artifact_id)
                         break
-                if artifact_id in failed_artifacts_ids: continue
-                        
+                if artifact_id in failed_artifacts_ids:
+                    continue
 
             # task_queue.put(artifact)
 
