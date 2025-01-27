@@ -33,8 +33,7 @@ RUN pip install --no-cache-dir --upgrade pip --no-warn-script-location
 RUN pip install --no-cache-dir """
     + " ".join(Dependencys)
     + """ --no-warn-script-location
-WORKDIR /app
-ENTRYPOINT ["python", "recipe/generate.py"]"""
+WORKDIR /app"""
 )
 
 
@@ -92,6 +91,10 @@ versions_schema = {
 
 
 class Artifact(abc.ABC):
+    def __init__(self):
+        super().__init__()
+        self.has_changed = False
+
     @abc.abstractmethod
     def build(self, recipes_folder, build_folder, artifacts, override=False):
         pass
@@ -107,6 +110,7 @@ class Artifact(abc.ABC):
 
 class Recipe(Artifact):
     def __init__(self, recipe_name, recipe_version, version_json, dependencies):
+        super().__init__()
         self.name = recipe_name
         self.version = recipe_version
         self.version_source_folder = version_json["folder"]
@@ -143,6 +147,12 @@ class PythonRecipe(Recipe):
     def __init__(self, recipe_name, recipe_version, version_json, dependencies):
         super().__init__(recipe_name, recipe_version, version_json, dependencies)
 
+    def dependencies_changed(self, artifacts):
+        for dependency in self.dependencies:
+            if artifacts[dependency.artifact_id()].has_changed:
+                return True
+        return False
+
     def build(self, recipes_folder, build_folder, artifacts, override=False):
         super().build(recipes_folder, build_folder, artifacts, override)
         logger = logging.getLogger("complott")
@@ -153,9 +163,10 @@ class PythonRecipe(Recipe):
         if os.path.exists(build_path):
             if (
                 not left_files_changed(filecmp.dircmp(recipe_path, build_path))
+                and not self.dependencies_changed(artifacts)
                 and not override
             ):
-                logger.debug(f"({self.name}): Skipped, recipe did not changed.")
+                logger.debug(f"Skipped '{self.id()}' (did not changed)")
                 return
             shutil.rmtree(build_path)
 
@@ -185,15 +196,24 @@ class PythonRecipe(Recipe):
             client = docker.from_env()
             container_logs = client.containers.run(
                 "recipe-sandbox",
+                ["python", "recipe/generate.py", self.version],
                 remove=True,
                 volumes=volumes,
                 network_disabled=True,
                 mem_limit="1000m",
             )
             container_logs_str = container_logs.decode("utf-8")
-            if len(container_logs_str) > 0:
-                logger.debug(f"({self.artifact_id()}): {container_logs_str}")
+            logger.debug(
+                f"Built '{self.id()}'"
+                + (
+                    f"\n ---> {container_logs_str}"
+                    if len(container_logs_str) > 0
+                    else ""
+                )
+            )
+            self.has_changed = True
         except docker.errors.ContainerError as e:
+            os.remove(os.path.join(build_path, "recipe.json"))
             match e.exit_status:
                 case 1:
                     raise Exception(e.stderr.decode("utf-8"))
@@ -229,17 +249,17 @@ class Fetch(Artifact):
         return f"{Fetch.__name__}:{self.url}"
 
     def _compact_url(self, max_length):
-        url_length = len(self.url)
-        if url_length <= max_length:
-            return self.url
-        else:
-            return f"{self.url[:20]}...{self.url[-46:]}"
+        parsed = urllib.parse.urlparse(self.url)
+        hostname = parsed.hostname.lower()
+        hostname_length = len(hostname)
+        target_name = parsed.path[parsed.path.rfind("/") + 1 :]
+        return f"{hostname}/.../{target_name[-max_length+hostname_length+5:]}"
 
     def build(self, recipes_folder, build_folder, artifacts, override=False):
         logger = logging.getLogger("complott")
         cache_file_path = self.get_build_path(build_folder)
         if os.path.exists(cache_file_path) and not override:
-            logger.debug(f"In cache: {self._compact_url(70)}")
+            logger.debug(f"Found '{self._compact_url(40)}' in cache")
             return True
 
         try:
@@ -247,13 +267,14 @@ class Fetch(Artifact):
             if not os.path.exists(fetch_folder):
                 os.mkdir(fetch_folder)
             urllib.request.urlretrieve(self.url, cache_file_path)
+            self.has_changed = True
         except Exception as e:
-            logger.error(f"Failed to download resource '{self.url}'\n ---> {e}")
+            logger.error(f"Failed to download '{self.url}'\n ---> {e}")
             if os.path.exists(cache_file_path):
                 os.remove(cache_file_path)
             raise e
 
-        logger.debug(f"Fetched:  {self._compact_url(70)}")
+        logger.debug(f"Fetched '{self._compact_url(40)}'")
         return True
 
 
