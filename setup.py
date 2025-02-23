@@ -12,7 +12,7 @@ setup(
     include_package_data=True,
     py_modules=["complott"],
     install_requires=[
-        "click",
+        "click","docker","jsonschema"
     ],
     entry_points={
         "console_scripts": [
